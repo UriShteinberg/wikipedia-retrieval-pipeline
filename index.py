@@ -29,6 +29,7 @@ PAGE_META_NAME = "page_meta.json"
 BM25_NAME = "bm25.npz"
 BM25_VOCAB_NAME = "bm25_vocab.json"
 PAGE_TEXTS_NAME = "page_texts.json"
+INDEX_TEXTS_NAME = "index_texts.json"
 
 EMBED_DIM = 384
 PAGE_WORD_CAP = 400          # title+content cap; MiniLM truncates ~256 tokens anyway
@@ -122,6 +123,8 @@ def build_index(*, entries_dir: Optional[Path] = None,
         "model": "sentence-transformers/all-MiniLM-L6-v2",
         "dim": dim, "num_vectors": len(chunk_page_ids), "num_pages": len(set(chunk_page_ids)),
     }, indent=2), encoding="utf-8")
+    (out_dir / INDEX_TEXTS_NAME).write_text(
+        json.dumps([c.text for c in chunks]), encoding="utf-8")
 
     # page channel: one dense vector + raw text per page
     page_ids = [int(r["page_id"]) for r in records]
@@ -141,12 +144,13 @@ def build_index(*, entries_dir: Optional[Path] = None,
     return chunk_index, chunk_page_ids
 
 
-def load_chunk_index(artifacts_dir: Optional[Path] = None) -> Tuple[faiss.Index, List[int]]:
-    """Load the chunk FAISS index and its chunk-row -> page_id map."""
+def load_chunk_index(artifacts_dir: Optional[Path] = None):
+    """Load the chunk FAISS index, its chunk-row -> page_id map, and chunk texts (or None)."""
     root = artifacts_dir or ARTIFACTS_DIR
     meta = json.loads((root / INDEX_META_NAME).read_text(encoding="utf-8"))
-    return _read_faiss(root / INDEX_FAISS_NAME), [int(x) for x in meta["page_ids"]]
-
+    tpath = root / INDEX_TEXTS_NAME
+    texts = json.loads(tpath.read_text(encoding="utf-8")) if tpath.exists() else None
+    return _read_faiss(root / INDEX_FAISS_NAME), [int(x) for x in meta["page_ids"]], texts
 
 def load_hybrid(artifacts_dir: Optional[Path] = None) -> Dict:
     """Load page vectors, page-level BM25, and page texts used by the hybrid retriever."""

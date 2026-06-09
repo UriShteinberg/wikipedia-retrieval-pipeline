@@ -21,6 +21,8 @@ W_DENSE, W_BM25, W_CHUNK = 0.3, 0.5, 0.2   # linear fusion weights
 CHUNK_TOPN = 256            # chunks fetched per query before max-pool to page
 CE_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CE_TOPK = 10                # candidates reranked by the cross-encoder
+W_CE = 0.85                   # CE weight in the top-K rerank; (1-W_CE) stays with fusion
+CE_USE_BEST_CHUNK = False    
 
 _H: Optional[Dict] = None
 _CHUNK = None
@@ -76,18 +78,20 @@ def _bm25_scores(tokens: List[str], h: Dict) -> np.ndarray:
     return scores
 
 
-def _chunk_page_scores(qvec: np.ndarray, artifacts_dir: Optional[Path]) -> Dict[int, float]:
-    """Search the chunk index and max-pool chunk cosine to a per-page score."""
-    index, chunk_page_ids = _chunk(artifacts_dir)
+def _chunk_page_scores(qvec: np.ndarray, artifacts_dir: Optional[Path]):
+    """Search the chunk index; return per-page best cosine and the best chunk row."""
+    index, chunk_page_ids, _ = _chunk(artifacts_dir)
     sc, idx = index.search(qvec[None, :], min(CHUNK_TOPN, index.ntotal))
     best: Dict[int, float] = {}
+    best_row: Dict[int, int] = {}
     for s, row in zip(sc[0], idx[0]):
-        if row < 0:                                   # FAISS pads with -1 when k > ntotal
+        if row < 0:
             continue
         pid = chunk_page_ids[int(row)]
         if pid not in best or s > best[pid]:
             best[pid] = float(s)
-    return best
+            best_row[pid] = int(row)
+    return best, best_row
 
 
 def _rank_one(query: str, qvec: np.ndarray, h: Dict, artifacts_dir: Optional[Path]) -> List[int]:
@@ -95,26 +99,39 @@ def _rank_one(query: str, qvec: np.ndarray, h: Dict, artifacts_dir: Optional[Pat
     page_ids = h["page_ids"]
     dense_all = h["page_vecs"] @ qvec
     bm25_all = _bm25_scores(tokenize(query), h)
-    chunk_best = _chunk_page_scores(qvec, artifacts_dir)
+    chunk_best, chunk_best_row = _chunk_page_scores(qvec, artifacts_dir)
 
     cand = np.argsort(-bm25_all)[:CAND_M]
-    if int((bm25_all[cand] > 0).sum()) == 0:          # no lexical hit -> back off to dense
+    if int((bm25_all[cand] > 0).sum()) == 0:
         cand = np.argsort(-dense_all)[:CAND_M]
     crows = [_PID2ROW[p] for p in chunk_best if p in _PID2ROW]
-    if crows:                                         # let strong chunk hits enter the pool
+    if crows:
         cand = np.union1d(cand, np.array(crows, dtype=cand.dtype))
 
     chunk_vec = np.array([chunk_best.get(page_ids[int(r)], 0.0) for r in cand], dtype=np.float32)
     fused = (W_DENSE * _minmax(dense_all[cand])
              + W_BM25 * _minmax(bm25_all[cand])
              + W_CHUNK * _minmax(chunk_vec))
-    order = cand[np.argsort(-fused)]
+    sort_idx = np.argsort(-fused)
+    order = cand[sort_idx]
+    fused_sorted = fused[sort_idx]
 
     if h.get("page_texts") is not None and len(order):
-        topk = order[:min(CE_TOPK, len(order))]
-        pairs = [(query, h["page_texts"][int(r)]) for r in topk]
+        k = min(CE_TOPK, len(order))
+        topk = order[:k]
+        _, _, chunk_texts = _chunk(artifacts_dir)
+        pairs = []
+        for r in topk:
+            pid = page_ids[int(r)]
+            crow = chunk_best_row.get(pid)
+            if CE_USE_BEST_CHUNK and chunk_texts is not None and crow is not None:
+                text = chunk_texts[crow]
+            else:
+                text = h["page_texts"][int(r)]
+            pairs.append((query, text))
         ce = np.asarray(_cross_encoder().predict(pairs, show_progress_bar=False))
-        order = np.concatenate([topk[np.argsort(-ce)], order[len(topk):]])
+        blended = W_CE * _minmax(ce) + (1.0 - W_CE) * _minmax(fused_sorted[:k])
+        order = np.concatenate([topk[np.argsort(-blended)], order[k:]])
 
     out, seen = [], set()
     for row in order:
