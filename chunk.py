@@ -1,16 +1,22 @@
 """Preprocessing and chunking.
 
-Adaptive word-window chunking: short pages stay one chunk; long pages split into
-overlapping windows so content past MiniLM's token limit is still represented.
-The title is prepended to every chunk so each unit carries the entity name.
+Paragraph-aware chunking: paragraphs are packed greedily into bins of a target
+word count, with one sentence of overlap carried between bins. Oversized
+paragraphs are split into fixed word windows. The title is prepended to every
+chunk so each unit carries the entity name. This reproduces the artifacts under
+artifacts/ (628,751 chunks over the corpus).
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-WORDS_PER_CHUNK = 180        # stays under MiniLM's ~256-token cap once the title is added
-WORD_OVERLAP = 40            # keeps facts that straddle a window boundary in both windows
+TARGET_WORDS = 150           # target words per chunk before flushing a bin
+HARD_MAX = 200               # paragraphs longer than this are windowed alone
+OVERLAP_SENTS = 1            # sentences carried from one bin to the next
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
 @dataclass
@@ -21,31 +27,63 @@ class Chunk:
     text: str
 
 
-def _window_words(text: str, size: int, overlap: int) -> List[str]:
-    """Split text into overlapping word windows (one window if short enough)."""
-    words = text.split()
-    if not words:
-        return []
-    if len(words) <= size:
-        return [" ".join(words)]
-    step = max(1, size - overlap)
-    windows: List[str] = []
-    for start in range(0, len(words), step):
-        windows.append(" ".join(words[start:start + size]))
-        if start + size >= len(words):
-            break
-    return windows
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences on terminal punctuation."""
+    return [p for p in _SENT_SPLIT.split(text.strip()) if p]
+
+
+def _chunk_text(title: str, content: str) -> List[str]:
+    """Pack paragraphs into ~TARGET_WORDS bins with sentence overlap; prefix title."""
+    title = (title or "").strip()
+    content = (content or "").strip()
+    if not content:
+        return [title] if title else [""]
+
+    paras = [p.strip() for p in content.split("\n\n") if p.strip()] or [content]
+    bins: List[str] = []
+    cur: List[str] = []
+    cur_n = 0
+    carry: List[str] = []
+
+    def flush() -> None:
+        nonlocal cur, cur_n, carry
+        if cur:
+            bins.append(" ".join(cur))
+            sents = _split_sentences(" ".join(cur))
+            carry = sents[-OVERLAP_SENTS:] if OVERLAP_SENTS else []
+            cur = list(carry)
+            cur_n = sum(len(s.split()) for s in carry)
+
+    for para in paras:
+        pw = para.split()
+        if len(pw) > HARD_MAX:                      # oversized: window it alone
+            flush()
+            step = max(1, TARGET_WORDS - 30)
+            for s in range(0, len(pw), step):
+                bins.append(" ".join(pw[s:s + TARGET_WORDS]))
+                if s + TARGET_WORDS >= len(pw):
+                    break
+            cur, cur_n, carry = [], 0, []
+            continue
+        if cur and cur_n + len(pw) > TARGET_WORDS:
+            flush()
+        cur.append(para)
+        cur_n += len(pw)
+
+    if cur and cur != carry:
+        bins.append(" ".join(cur))
+
+    pref = (title + "\n\n") if title else ""
+    return [(pref + b).strip() for b in bins] if bins else [title]
 
 
 def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
     """Split one corpus entry into one or more title-prefixed chunks."""
     page_id = int(record["page_id"])
-    title = str(record.get("title", "")).strip()
-    content = str(record.get("content", "")).strip()
-    windows = _window_words(content, WORDS_PER_CHUNK, WORD_OVERLAP) or ([title] if title else [""])
-    return [Chunk(page_id=page_id, chunk_id=cid,
-                  text=f"{title}\n\n{w}".strip() if title else w)
-            for cid, w in enumerate(windows)]
+    title = str(record.get("title", ""))
+    content = str(record.get("content", ""))
+    return [Chunk(page_id=page_id, chunk_id=cid, text=text)
+            for cid, text in enumerate(_chunk_text(title, content))]
 
 
 def chunk_corpus(records: List[Dict[str, Any]]) -> List[Chunk]:
