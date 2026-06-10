@@ -60,3 +60,40 @@ Prints mean NDCG@10 on the public query set. No index build is required — `run
 loads the prebuilt artifacts from `artifacts/`.
 
 Expected output:
+```
+public_queries=29
+mean_ndcg@10=0.4597
+query_phase_time≈19s
+```
+
+## Rebuilding the index (optional, offline)
+
+The artifacts are committed, so this is **not** needed to run the evaluation. To
+regenerate them from the corpus:
+
+```bash
+python scripts/build_index.py     # or: python main.py
+```
+
+This re-chunks, re-embeds, and rebuilds all artifacts. It is slow (CPU embedding
+of ~628k chunks) and untimed — it is never run at grading. The committed
+`chunk.py` reproduces the committed `index.faiss` exactly.
+
+## Repository layout
+
+```
+main.py             run(queries) — graded entry point
+chunk.py            paragraph-aware chunker
+embed.py            MiniLM embeddings
+index.py            artifact build + load
+retrieve.py         query-time hybrid retrieval + CE rerank
+utils.py            shared paths and helpers
+eval.py             NDCG@10 utilities (read-only)
+scripts/            eval_public.py, build_index.py (read-only)
+artifacts/          prebuilt index + embeddings (Git LFS)
+data/               corpus + public queries
+```
+
+## Video
+
+[Presentation video](ADD_YOUR_LINK_HERE) — pipeline walkthrough and empirical results.
