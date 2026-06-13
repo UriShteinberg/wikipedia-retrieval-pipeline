@@ -96,4 +96,4 @@ data/               corpus + public queries
 
 ## Video
 
-[Presentation video](ADD_YOUR_LINK_HERE) — pipeline walkthrough and empirical results.
+[Presentation video](https://youtu.be/-M82wMK-Jt8) — pipeline walkthrough and empirical results.
